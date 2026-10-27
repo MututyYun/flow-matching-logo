@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow Matching · 三层投射原型</title>
+<style>
+  :root { --bg:#04050a; --fg:#eef2ff; --muted:#7f8bb0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden; }
+  body { font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; color:var(--fg); }
+  #stage { display:flex; width:100vw; height:100vh; }
+  .view { position:relative; flex:1 1 50%; height:100%; overflow:hidden; }
+  .view + .view { border-left:1px solid rgba(120,140,200,.12); }
+  .view canvas { display:block; }
+  .label { position:absolute; top:22px; left:26px; pointer-events:none; }
+  .label .name { font-size:17px; letter-spacing:.28em; font-weight:600; }
+  .label .sub { margin-top:5px; font-size:10px; letter-spacing:.24em; color:var(--muted); }
+  .badge { position:absolute; left:26px; bottom:82px; display:flex; align-items:baseline; gap:8px;
+           pointer-events:none; }
+  .badge .num { font-size:46px; font-weight:200; letter-spacing:.02em; line-height:1;
+                font-variant-numeric:tabular-nums; }
+  .badge .unit { font-size:11px; letter-spacing:.24em; color:var(--muted); }
+  #v1 .badge .num { color:#ff6a7f; text-shadow:0 0 30px rgba(255,60,100,.55); }
+  #v2 .badge .num { color:#3dffc8; text-shadow:0 0 30px rgba(45,255,200,.5); }
+  #hud { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+         display:flex; align-items:center; gap:14px; padding:10px 18px;
+         background:rgba(12,16,30,.72); border:1px solid rgba(120,140,200,.18);
+         border-radius:999px; backdrop-filter:blur(12px); }
+  button { appearance:none; border:1px solid rgba(140,160,220,.28);
+           background:rgba(255,255,255,.04); color:var(--fg);
+           padding:7px 16px; border-radius:999px; font-size:12px;
+           letter-spacing:.08em; cursor:pointer; }
+  button:hover { background:rgba(255,255,255,.1); }
+  input[type=range] { width:300px; accent-color:#ff3b63; }
+  #pct { font-variant-numeric:tabular-nums; font-size:12px; color:var(--muted); width:38px; text-align:right; }
+  .hint { position:fixed; right:20px; bottom:28px; font-size:10px; letter-spacing:.14em; color:rgba(127,139,176,.55); }
+  #err { position:fixed; left:0; top:0; z-index:999; color:#ff5a5a; font:12px monospace;
+         white-space:pre-wrap; padding:8px; pointer-events:none; max-width:100vw; }
+</style>
+</head>
+<body>
+<div id="err"></div>
+<div id="stage">
+  <div class="view" id="v1">
+    <div class="label">
+      <div class="name">1-RF</div>
+      <div class="sub">EULER · ITERATIVE</div>
+    </div>
+    <div class="badge"><span class="num">1</span><span class="unit">步</span></div>
+  </div>
+  <div class="view" id="v2">
+    <div class="label">
+      <div class="name">2-RF</div>
+      <div class="sub">ONE REFLOW · ONE STEP</div>
+    </div>
+    <div class="badge"><span class="num">1</span><span class="unit">步</span></div>
+  </div>
+</div>
+<div id="hud">
+  <button id="btnPlay">暂停</button>
+  <button id="btnReplay">重播</button>
+  <input id="scrub" type="range" min="0" max="1000" value="0">
+  <span id="pct">0%</span>
+</div>
+<div class="hint">SIDE 45° · PROJECTION VIEW</div>
+
+<script>
+(function () {
+  const box = () => document.getElementById('err');
+  window.addEventListener('error', function (e) {
+    box().textContent += 'ERROR: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0) + '\n';
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    box().textContent += 'REJECT: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason) + '\n';
+  });
+})();
+</script>
+<script src="./vendor/gsap.min.js"></script>
+<script src="./data.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const P = window.PROTO;
+const gsap = window.gsap;
+if (!P || !gsap) throw new Error('PROTO data or GSAP missing');
+
+/* ---------------- decode ---------------- */
+function b64bytes(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function decodeI16(b64, scale) {
+  const q = new Int16Array(b64bytes(b64).buffer);
+  const out = new Float32Array(q.length);
+  for (let i = 0; i < q.length; i++) out[i] = q[i] / scale;
+  return out;
+}
+const decodeF32 = b64 => new Float32Array(b64bytes(b64).buffer);
+const decodeU16 = b64 => new Uint16Array(b64bytes(b64).buffer);
+
+const N = P.n, F = P.frames, NL = P.nLine, SCALE = P.scale;
+const x0 = decodeI16(P.x0, SCALE);
+const s1 = decodeI16(P.step1, SCALE);   // (5, N, 2)
+const s2 = decodeI16(P.step2, SCALE);
+const light = decodeF32(P.light);
+const lineIdx = decodeU16(P.lineIdx);
+const STEP_COUNTS = P.stepCounts;       // [1, 2, 4, 10, 50]
+
+/* three layers along z */
+const Z0 = 0.0, Z1 = 1.7, Z2 = 3.4;
+const YAW = Math.PI / 4, PITCH = 0.55;
+const DIR = {
+  x: Math.cos(PITCH) * Math.sin(YAW),
+  y: Math.sin(PITCH),
+  z: Math.cos(PITCH) * Math.cos(YAW),
+};
+
+/* ---------------- palettes ---------------- */
+function makeRamp(stops) {
+  const s = stops.map(([u, hex]) => [u, new THREE.Color(hex)]);
+  return function (u) {
+    u = Math.max(0, Math.min(1, u));
+    for (let i = 1; i < s.length; i++) {
+      if (u <= s[i][0]) {
+        const [u0, c0] = s[i - 1], [u1, c1] = s[i];
+        return c0.clone().lerp(c1, (u - u0) / (u1 - u0 || 1));
+      }
+    }
+    return s[s.length - 1][1].clone();
+  };
+}
+const WARM = makeRamp([
+  [0.00, 0x14020a], [0.24, 0x5e0a24], [0.46, 0xd4143f],
+  [0.66, 0xff5c2e], [0.84, 0xffab5e], [1.00, 0xfff2df],
+]);
+const COOL = makeRamp([
+  [0.00, 0x001310], [0.24, 0x064a3c], [0.46, 0x0fd8a8],
+  [0.66, 0x2effc0], [0.84, 0x9effe0], [1.00, 0xeafff8],
+]);
+
+function hash(i) {
+  let x = (i * 374761393 + 668265263) | 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177);
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967295;
+}
+
+function makeColors(ramp) {
+  const target = new Float32Array(N * 3);
+  const source = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    const u = (light[i] - 0.30) / 0.55;
+    const uu = Math.max(0, Math.min(1, u + (hash(i) - 0.5) * 0.14));
+    const c = ramp(uu).multiplyScalar(1.15);
+    target[3 * i] = c.r; target[3 * i + 1] = c.g; target[3 * i + 2] = c.b;
+
+    const s = ramp(0.04 + hash(i + 9001) * 0.12).multiplyScalar(0.70);
+    source[3 * i] = s.r; source[3 * i + 1] = s.g; source[3 * i + 2] = s.b;
+  }
+  return { target, source };
+}
+const WARM_COL = makeColors(WARM);
+const COOL_COL = makeColors(COOL);
+
+/* ---------------- geometry helpers ---------------- */
+function makeSprite() {
+  const size = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0.0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.30, 'rgba(255,255,255,0.85)');
+  g.addColorStop(0.65, 'rgba(255,255,255,0.18)');
+  g.addColorStop(1.0, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sprite = makeSprite();
+
+function layerPositions(xy, z) {
+  const arr = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    arr[3 * i] = xy[2 * i];
+    arr[3 * i + 1] = xy[2 * i + 1];
+    arr[3 * i + 2] = z;
+  }
+  return arr;
+}
+
+function makePointCloud(pos, col, size, opacity, blending = THREE.AdditiveBlending) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const mat = new THREE.PointsMaterial({
+    size, map: sprite, vertexColors: true, transparent: true, opacity,
+    depthWrite: false, blending, sizeAttenuation: true,
+  });
+  return new THREE.Points(geo, mat);
+}
+
+const LINE_USE = 200;
+function makeLines(fromXY, toXY, zFrom, zTo, opacity) {
+  const pos = new Float32Array(LINE_USE * 6);
+  const step = NL / LINE_USE;
+  for (let k = 0; k < LINE_USE; k++) {
+    const i = lineIdx[Math.min(NL - 1, Math.floor(k * step))];
+    pos[6 * k]     = fromXY[2 * i];
+    pos[6 * k + 1] = fromXY[2 * i + 1];
+    pos[6 * k + 2] = zFrom;
+    pos[6 * k + 3] = toXY[2 * i];
+    pos[6 * k + 4] = toXY[2 * i + 1];
+    pos[6 * k + 5] = zTo;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xdfe6ff, transparent: true, opacity,
+    depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  return { geo, mat };
+}
+
+/* ---------------- camera ---------------- */
+function setCamera(camera, t) {
+  const e = t * t * (3 - 2 * t);
+  const dist = 17 - 4.0 * e;
+  const lookZ = Z1 + (Z2 * 0.72 - Z1) * e;
+  camera.position.set(DIR.x * dist, DIR.y * dist, DIR.z * dist + lookZ);
+  camera.lookAt(0, 0, lookZ);
+}
+
+/* ---------------- views ---------------- */
+function buildView(el, steps, colors, isReflow) {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04050a);
+  scene.fog = new THREE.FogExp2(0x04050a, 0.010);
+
+  const w = el.clientWidth || 800, h = el.clientHeight || 900;
+  const camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 200);
+  setCamera(camera, 0);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+  renderer.setSize(w, h);
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.12;
+  el.appendChild(renderer.domElement);
+
+  const step1XY = steps.subarray(0, N * 2);
+  const step50XY = steps.subarray(4 * N * 2, 5 * N * 2);
+
+  const source = makePointCloud(layerPositions(x0, Z0), colors.source, 0.038, 0.45);
+  const layer1 = makePointCloud(layerPositions(step1XY, Z1), colors.target, 0.048, 0.0, THREE.NormalBlending);
+  const layer2 = makePointCloud(layerPositions(step50XY, Z2), colors.target, 0.055, 0.08, THREE.NormalBlending);
+  const moving = makePointCloud(layerPositions(x0, Z0), colors.target, 0.052, 1.0);
+  const ghost1 = makePointCloud(layerPositions(step1XY, Z1), colors.target, 0.040, 0.0);
+  const ghost2 = makePointCloud(layerPositions(step1XY, Z1), colors.target, 0.036, 0.0);
+  scene.add(source, layer1, layer2, moving, ghost1, ghost2);
+
+  const lineA = makeLines(x0, step1XY, Z0, Z1, 0.040);
+  const lineB = makeLines(step1XY, step50XY, Z1, Z2, 0.0);
+  scene.add(new THREE.LineSegments(lineA.geo, lineA.mat));
+  scene.add(new THREE.LineSegments(lineB.geo, lineB.mat));
+
+  const composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+  composer.addPass(new UnrealBloomPass(new THREE.Vector2(w, h), 0.55, 0.45, 0.55));
+  composer.addPass(new OutputPass());
+
+  return {
+    el, scene, camera, renderer, composer, steps,
+    sourceMat: source.material,
+    layer1Mat: layer1.material,
+    layer2Mat: layer2.material,
+    movingMat: moving.material,
+    movingGeo: moving.geometry,
+    ghost1Mat: ghost1.material, ghost1Geo: ghost1.geometry,
+    ghost2Mat: ghost2.material, ghost2Geo: ghost2.geometry,
+    lineAMat: lineA.mat,
+    lineBMat: lineB.mat,
+    isReflow,
+  };
+}
+
+const views = [
+  buildView(document.getElementById('v1'), s1, WARM_COL, false),
+  buildView(document.getElementById('v2'), s2, COOL_COL, true),
+];
+
+/* ---------------- animation ---------------- */
+const A = 0.22, B = 0.38, C = 0.86;
+const state = { t: 0 };
+const scrub = document.getElementById('scrub');
+const pct = document.getElementById('pct');
+const btnPlay = document.getElementById('btnPlay');
+const badge1 = document.querySelector('#v1 .badge .num');
+const badge2 = document.querySelector('#v2 .badge .num');
+
+function stepSlice(steps, idx) {
+  return steps.subarray(idx * N * 2, (idx + 1) * N * 2);
+}
+
+function writePositions(geo, xy, z) {
+  const arr = geo.attributes.position.array;
+  for (let i = 0; i < N; i++) {
+    arr[3 * i] = xy[2 * i];
+    arr[3 * i + 1] = xy[2 * i + 1];
+    arr[3 * i + 2] = z;
+  }
+  geo.attributes.position.needsUpdate = true;
+}
+
+function applyT(t) {
+  t = Math.max(0, Math.min(1, t));
+
+  let z, idx, nextIdx, frac, phase;
+  if (t < A) {
+    const u = t / A;
+    z = Z0 + (Z1 - Z0) * u;
+    idx = 0; nextIdx = 0; frac = u; phase = 'to1';
+  } else if (t < B) {
+    z = Z1; idx = 0; nextIdx = 0; frac = 1; phase = 'hold1';
+  } else if (t < C) {
+    const u = (t - B) / (C - B);
+    z = Z1 + (Z2 - Z1) * u;
+    if (u < 0.18) { idx = 0; nextIdx = 1; frac = u / 0.18; }
+    else if (u < 0.36) { idx = 1; nextIdx = 2; frac = (u - 0.18) / 0.18; }
+    else if (u < 0.52) { idx = 2; nextIdx = 3; frac = (u - 0.36) / 0.16; }
+    else { idx = 3; nextIdx = 4; frac = (u - 0.52) / 0.48; }
+    phase = 'iterate';
+  } else {
+    z = Z2; idx = 4; nextIdx = 4; frac = 1; phase = 'done';
+  }
+
+  const uC = phase === 'iterate' ? (t - B) / (C - B) : (phase === 'done' ? 1 : 0);
+  const smooth = frac * frac * (3 - 2 * frac);
+
+  for (const v of views) {
+    const st = v.steps;
+    let fromXY, toXY;
+    if (phase === 'to1') {
+      fromXY = x0;
+      toXY = stepSlice(st, 0);
+    } else {
+      fromXY = stepSlice(st, idx);
+      toXY = stepSlice(st, nextIdx);
+    }
+
+    /* 2-RF 只有一个目标层：迭代阶段固定在 Z1，避免和 Z2 层错开成双影 */
+    let vz = z;
+    if (v.isReflow && (phase === 'iterate' || phase === 'done')) vz = Z1;
+
+    const pos = v.movingGeo.attributes.position.array;
+    for (let i = 0; i < N; i++) {
+      const o = i * 2;
+      pos[3 * i]     = fromXY[o]     + (toXY[o]     - fromXY[o])     * smooth;
+      pos[3 * i + 1] = fromXY[o + 1] + (toXY[o + 1] - fromXY[o + 1]) * smooth;
+      pos[3 * i + 2] = vz;
+    }
+    v.movingGeo.attributes.position.needsUpdate = true;
+
+    /* ghosts: only on 1-RF during iteration */
+    if (phase === 'iterate' && !v.isReflow) {
+      const g1i = Math.max(0, idx - 1);
+      const g2i = Math.max(0, idx - 2);
+      writePositions(v.ghost1Geo, stepSlice(st, g1i), Z1 + (Z2 - Z1) * uC * 0.92);
+      writePositions(v.ghost2Geo, stepSlice(st, g2i), Z1 + (Z2 - Z1) * uC * 0.84);
+      const pulse = Math.sin(Math.min(1, uC) * Math.PI);
+      v.ghost1Mat.opacity = 0.12 * pulse;
+      v.ghost2Mat.opacity = 0.06 * pulse;
+    } else {
+      v.ghost1Mat.opacity = 0;
+      v.ghost2Mat.opacity = 0;
+    }
+
+    /* layer opacities */
+    let l1, l2;
+    if (phase === 'to1') {
+      l1 = 0.55 * Math.min(1, t / (A * 0.9));
+      l2 = 0.08;
+    } else if (phase === 'hold1') {
+      l1 = 0.62; l2 = 0.08;
+    } else if (phase === 'iterate') {
+      l1 = 0.22; l2 = 0.10 + 0.42 * uC;
+    } else {
+      l1 = 0.18; l2 = 0.62;
+    }
+    v.layer1Mat.opacity = v.isReflow ? 0 : l1;
+    v.layer2Mat.opacity = v.isReflow ? 0 : l2;
+    v.sourceMat.opacity = 0.45 * (1 - 0.55 * t);
+    v.movingMat.opacity = phase === 'done' ? 0.55 : 1.0;
+
+    /* lines */
+    if (v.isReflow) {
+      v.lineAMat.opacity = phase === 'done' ? 0.0 : 0.040;
+      v.lineBMat.opacity = 0.0;
+    } else if (phase === 'to1' || phase === 'hold1') {
+      v.lineAMat.opacity = 0.040;
+      v.lineBMat.opacity = 0.0;
+    } else if (phase === 'iterate') {
+      v.lineAMat.opacity = 0.040 * Math.max(0, 1 - uC / 0.22);
+      v.lineBMat.opacity = 0.035 * Math.min(1, uC * 2);
+    } else {
+      v.lineAMat.opacity = 0.0;
+      v.lineBMat.opacity = 0.030;
+    }
+
+    setCamera(v.camera, t);
+  }
+
+  /* badges */
+  let n1;
+  if (phase === 'to1' || phase === 'hold1') n1 = '1';
+  else if (phase === 'iterate') n1 = String(STEP_COUNTS[nextIdx]);
+  else n1 = '50';
+  if (badge1.textContent !== n1) badge1.textContent = n1;
+  if (badge2.textContent !== '1') badge2.textContent = '1';
+
+  scrub.value = Math.round(t * 1000);
+  pct.textContent = Math.round(t * 100) + '%';
+}
+
+/* ---------------- timeline ---------------- */
+const tl = gsap.timeline({ paused: true, onUpdate: () => applyT(state.t) });
+tl.to(state, { t: 1, duration: 12, ease: 'none' });
+
+let playing = false;
+function play() {
+  if (state.t >= 0.999) state.t = 0;
+  tl.play();
+  playing = true;
+  btnPlay.textContent = '暂停';
+}
+function pause() {
+  tl.pause();
+  playing = false;
+  btnPlay.textContent = '播放';
+}
+btnPlay.addEventListener('click', () => (playing ? pause() : play()));
+document.getElementById('btnReplay').addEventListener('click', () => {
+  state.t = 0;
+  tl.restart();
+  playing = true;
+  btnPlay.textContent = '暂停';
+});
+scrub.addEventListener('input', () => {
+  pause();
+  const t = +scrub.value / 1000;
+  state.t = t;
+  tl.progress(t);
+  applyT(t);
+});
+
+/* ---------------- boot / render ---------------- */
+const params = new URLSearchParams(location.search);
+const tParam = params.get('t');
+const clean = params.get('clean') === '1';
+if (clean) {
+  document.getElementById('hud').style.display = 'none';
+  document.querySelector('.hint').style.display = 'none';
+}
+
+if (tParam !== null) {
+  const t = Math.max(0, Math.min(1, parseFloat(tParam) || 0));
+  state.t = t;
+  tl.pause();
+  tl.progress(t);
+  applyT(t);
+  playing = false;
+  btnPlay.textContent = '播放';
+} else if (!clean) {
+  applyT(0);
+  setTimeout(play, 300);
+} else {
+  applyT(0);
+}
+
+/* seek hook for frame export */
+window.__seek = function (t) {
+  state.t = t;
+  tl.pause();
+  tl.progress(t);
+  applyT(t);
+  renderViews();
+  return true;
+};
+window.__ready = true;
+
+function renderViews() {
+  const noBloom = new URLSearchParams(location.search).get('nobloom') === '1';
+  for (const v of views) {
+    if (noBloom) v.renderer.render(v.scene, v.camera);
+    else v.composer.render();
+  }
+}
+
+try {
+  renderViews();
+  document.documentElement.dataset.boot = 'ready';
+  document.documentElement.dataset.tparam = String(tParam);
+  document.documentElement.dataset.stateT = String(state.t);
+  document.documentElement.dataset.pct = pct.textContent;
+} catch (e) {
+  document.documentElement.dataset.booterr = String((e && (e.stack || e.message)) || e);
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+  renderViews();
+}
+animate();
+
+addEventListener('resize', () => {
+  for (const v of views) {
+    const w = v.el.clientWidth, h = v.el.clientHeight;
+    v.camera.aspect = w / h;
+    v.camera.updateProjectionMatrix();
+    v.renderer.setSize(w, h);
+    v.composer.setSize(w, h);
+  }
+});
+</script>
+</body>
+</html>

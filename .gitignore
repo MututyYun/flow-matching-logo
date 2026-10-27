@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node / 打包生成物（需要时由 npm install 和 build_*.py 重新生成）
+prototype/node_modules/
+prototype/*_standalone.html
+prototype/*_main.js
+prototype/bundle*.js
+prototype/*_data.js
+prototype/data.js
+
+# 逐帧截图与验证截图
+prototype/frames_*/
+prototype/shots/
+
+# 系统文件
+.DS_Store
+Thumbs.db

@@ -1,0 +1,946 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>少走弯路 · 用 Flow Matching 降低扩散模型的迭代次数</title>
+<style>
+  :root{
+    --bg:#08080c;
+    --ink:#EFECE6;
+    --dim:#A29D95;
+    --faint:#6E6A64;
+    --red:#C43B2F;
+    --red-br:#E4594B;
+    --gold:#D5B26B;
+    --teal:#45C9A6;
+    --line:rgba(235,225,210,.10);
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;background:#040406;overflow:hidden;}
+  body{
+    font-family:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC","Hiragino Sans GB","Noto Sans CJK SC",sans-serif;
+    color:var(--ink);
+    -webkit-font-smoothing:antialiased;
+  }
+  #stage{
+    position:absolute;left:50%;top:50%;width:1920px;height:1080px;
+    background:var(--bg);
+    transform-origin:center center;
+    overflow:hidden;
+  }
+  /* ---------- background ---------- */
+  .bgfx{
+    position:absolute;inset:0;pointer-events:none;
+    background:
+      radial-gradient(1150px 720px at 84% 6%, rgba(160,44,34,.17), transparent 62%),
+      radial-gradient(900px 620px at 8% 96%, rgba(44,74,140,.13), transparent 64%),
+      radial-gradient(700px 500px at 50% 50%, rgba(30,30,40,.35), transparent 70%);
+  }
+  .bgfx:after{
+    content:"";position:absolute;inset:0;
+    background-image:linear-gradient(rgba(255,255,255,.016) 1px, transparent 1px),
+                     linear-gradient(90deg, rgba(255,255,255,.016) 1px, transparent 1px);
+    background-size:120px 120px;
+    mask-image:radial-gradient(1200px 800px at 50% 45%, #000 0%, transparent 75%);
+    -webkit-mask-image:radial-gradient(1200px 800px at 50% 45%, #000 0%, transparent 75%);
+  }
+  .vignette{
+    position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(120% 90% at 50% 50%, transparent 55%, rgba(0,0,0,.55) 100%);
+  }
+  /* ---------- slides ---------- */
+  .slide{
+    position:absolute;inset:0;
+    padding:96px 120px 110px;
+    opacity:0;visibility:hidden;
+    transform:translateY(26px) scale(.996);
+    transition:opacity .55s ease, transform .8s cubic-bezier(.2,.8,.2,1), visibility 0s linear .55s;
+  }
+  .slide.active{
+    opacity:1;visibility:visible;transform:none;z-index:2;
+    transition:opacity .65s ease, transform .9s cubic-bezier(.2,.8,.2,1), visibility 0s;
+  }
+  .anim{opacity:0;transform:translateY(18px);transition:opacity .8s ease, transform .9s cubic-bezier(.2,.8,.2,1);transition-delay:var(--d,0s);}
+  .slide.active .anim{opacity:1;transform:none;}
+  .slide:not(.active) .anim{transition-delay:0s;transition-duration:.3s;}
+
+  .kicker{
+    font-size:19px;letter-spacing:.38em;color:var(--gold);
+    font-weight:400;margin-bottom:26px;
+  }
+  .kicker span{color:var(--faint);letter-spacing:.3em;margin-left:14px;}
+  h1{
+    font-size:128px;font-weight:200;letter-spacing:.10em;line-height:1.05;
+    text-shadow:0 0 80px rgba(196,59,47,.18);
+  }
+  h2{
+    font-size:64px;font-weight:300;letter-spacing:.045em;line-height:1.22;
+  }
+  .lead{
+    font-size:27px;line-height:1.85;color:#C6C1B8;font-weight:300;
+    max-width:820px;
+  }
+  h2 + .lead{margin-top:20px;}
+  .lead b{color:var(--ink);font-weight:400;}
+  .lead em{font-style:normal;color:var(--gold);}
+  .pts{list-style:none;margin-top:44px;display:flex;flex-direction:column;gap:22px;}
+  .pts li{
+    position:relative;padding-left:34px;font-size:24px;line-height:1.75;color:#B9B4AC;font-weight:300;
+  }
+  .pts li:before{
+    content:"";position:absolute;left:0;top:14px;width:10px;height:10px;
+    border:1px solid var(--red-br);transform:rotate(45deg);
+  }
+  .pts li b{color:var(--ink);font-weight:500;margin-right:12px;letter-spacing:.04em;}
+
+  /* ---------- chrome ---------- */
+  .brand{
+    position:absolute;left:64px;bottom:40px;z-index:6;
+    font-size:14px;letter-spacing:.34em;color:rgba(200,195,186,.42);
+  }
+  .counter{
+    position:absolute;right:64px;bottom:34px;z-index:6;
+    font-family:"Cascadia Mono",Consolas,"SF Mono",monospace;
+    font-size:16px;letter-spacing:.12em;color:rgba(200,195,186,.40);
+  }
+  .counter b{color:rgba(240,235,226,.85);font-weight:400;}
+  .dots{
+    position:absolute;left:50%;bottom:38px;transform:translateX(-50%);
+    display:flex;gap:12px;z-index:6;
+  }
+  .dots .dot{
+    width:7px;height:7px;border-radius:50%;border:0;padding:0;cursor:pointer;
+    background:rgba(230,225,215,.22);transition:all .3s ease;
+  }
+  .dots .dot:hover{background:rgba(230,225,215,.5);}
+  .dots .dot.on{background:var(--red-br);width:22px;border-radius:4px;box-shadow:0 0 14px rgba(228,89,75,.6);}
+  .navbtn{
+    position:absolute;top:50%;transform:translateY(-50%);z-index:6;
+    width:56px;height:88px;border:0;background:transparent;color:rgba(235,230,220,.25);
+    font-size:52px;font-weight:200;cursor:pointer;transition:color .3s,background .3s;
+    display:flex;align-items:center;justify-content:center;line-height:1;
+  }
+  .navbtn:hover{color:rgba(235,230,220,.75);background:linear-gradient(90deg,rgba(255,255,255,.03),transparent);}
+  .navbtn.prev{left:10px;}
+  .navbtn.next{right:10px;}
+  .navbtn.next:hover{background:linear-gradient(270deg,rgba(255,255,255,.03),transparent);}
+  .hint{
+    position:absolute;left:64px;bottom:78px;z-index:6;
+    font-size:14px;letter-spacing:.18em;color:rgba(200,195,186,.35);
+    transition:opacity 1s ease;
+  }
+
+  /* ---------- cover ---------- */
+  .cover{display:grid;grid-template-columns:1.18fr .82fr;align-items:center;padding:0 130px 0 140px;}
+  .cover-left{padding-top:10px;}
+  .cover h1{margin:6px 0 26px;}
+  .rule{width:150px;height:1px;background:linear-gradient(90deg,var(--red-br),rgba(228,89,75,0));margin-bottom:34px;}
+  .cover .lead{font-size:32px;letter-spacing:.02em;}
+  .cover .sub{font-size:21px;color:var(--faint);letter-spacing:.06em;margin-top:22px;font-weight:300;}
+  .cover .meta{
+    margin-top:64px;display:flex;gap:52px;
+    font-family:"Cascadia Mono",Consolas,monospace;font-size:15px;color:rgba(200,195,186,.55);letter-spacing:.06em;
+  }
+  .cover .meta b{display:block;font-family:"Microsoft YaHei UI",sans-serif;font-size:26px;font-weight:300;color:#DDD8CF;letter-spacing:.02em;margin-bottom:8px;}
+  .cover-right{position:relative;display:flex;align-items:center;justify-content:center;height:100%;}
+  .cover-right .halo{
+    position:absolute;width:780px;height:780px;border-radius:50%;
+    background:radial-gradient(circle, rgba(196,59,47,.28) 0%, rgba(196,59,47,.10) 38%, transparent 66%);
+    filter:blur(10px);
+  }
+  .cover-right img{
+    position:relative;width:470px;height:auto;display:block;
+    -webkit-mask-image:radial-gradient(circle, #000 0 2.35px, transparent 2.9px);
+    -webkit-mask-size:9px 9px;
+    -webkit-mask-repeat:repeat;
+    mask-image:radial-gradient(circle, #000 0 2.35px, transparent 2.9px);
+    mask-size:9px 9px;
+    mask-repeat:repeat;
+    filter:drop-shadow(0 0 46px rgba(196,59,47,.35));
+  }
+
+  /* ---------- split layout ---------- */
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center;margin-top:26px;}
+  .dgm{width:100%;height:auto;display:block;overflow:visible;}
+  .dlabel{font-size:17px;fill:#8C8880;letter-spacing:.14em;font-family:"Microsoft YaHei UI",sans-serif;}
+  .dcode{font-size:18px;fill:#D5B26B;font-family:"Cascadia Mono",Consolas,monospace;letter-spacing:.06em;}
+  .dfaint{font-size:15px;fill:#6E6A64;letter-spacing:.16em;}
+
+  /* formula card */
+  .formula{
+    margin-top:34px;padding:30px 36px;border:1px solid var(--line);border-left:2px solid var(--red-br);
+    background:linear-gradient(90deg, rgba(196,59,47,.07), rgba(255,255,255,.015) 55%, transparent);
+    display:flex;flex-direction:column;gap:14px;
+  }
+  .formula .f1{font-family:"Cambria Math","Cascadia Mono",Consolas,serif;font-size:33px;letter-spacing:.02em;color:#EDE7DC;}
+  .formula .f2{font-family:"Cambria Math","Cascadia Mono",Consolas,serif;font-size:24px;color:var(--gold);}
+  .formula .fnote{font-size:15px;color:var(--faint);letter-spacing:.12em;margin-top:2px;}
+
+  /* ---------- size / stats ---------- */
+  .stat{font-family:"Cascadia Mono",Consolas,monospace;font-weight:300;}
+  .stat .num{font-size:76px;letter-spacing:-.01em;color:var(--ink);line-height:1;}
+  .stat .num em{font-style:normal;font-size:34px;color:var(--faint);margin-left:6px;letter-spacing:0;}
+  .stat .cap{font-family:"Microsoft YaHei UI",sans-serif;font-size:16px;color:var(--faint);letter-spacing:.22em;margin-top:14px;}
+
+  /* ---------- setting table ---------- */
+  .setgrid{display:grid;grid-template-columns:1fr 1fr;gap:70px;align-items:center;margin-top:34px;}
+  .spec{border-top:1px solid var(--line);}
+  .spec .row{
+    display:grid;grid-template-columns:130px 1fr;gap:24px;
+    padding:19px 4px;border-bottom:1px solid var(--line);align-items:baseline;
+  }
+  .spec .k{font-size:16px;letter-spacing:.22em;color:var(--faint);}
+  .spec .v{font-size:22px;color:#D8D3CA;font-weight:300;letter-spacing:.02em;}
+  .spec .v b{font-family:"Cascadia Mono",Consolas,monospace;color:var(--gold);font-weight:400;}
+  .mlpwrap{position:relative;text-align:center;}
+  .mlpwrap .cap{font-size:17px;letter-spacing:.2em;color:var(--faint);margin-top:6px;}
+  .mlpwrap .cap b{color:var(--gold);font-family:"Cascadia Mono",Consolas,monospace;font-weight:400;letter-spacing:.04em;}
+
+  /* ---------- media slides ---------- */
+  .vslide{
+    display:grid;grid-template-columns:392px 1fr;gap:66px;align-items:center;
+    padding:0 64px 0 110px;
+  }
+  .vcol .kicker{margin-bottom:22px;}
+  .vcol h2{font-size:52px;line-height:1.25;}
+  .vcol .lead{font-size:21px;line-height:1.85;margin-top:26px;max-width:392px;}
+  .vcol .pts{margin-top:30px;gap:14px;}
+  .vcol .pts li{font-size:19px;line-height:1.65;padding-left:26px;}
+  .vcol .pts li:before{width:8px;height:8px;top:11px;}
+  .vcol .bigstat{margin-top:38px;}
+  .vcol .bigstat .num{font-size:62px;}
+  .vcol .bigstat .cap{font-size:14px;margin-top:10px;}
+  .vframe{
+    position:relative;width:100%;aspect-ratio:16/9;background:#04050a;
+    outline:1px solid rgba(255,255,255,.07);
+    box-shadow:0 40px 100px rgba(0,0,0,.65);
+  }
+  .vframe video{width:100%;height:100%;display:block;object-fit:cover;background:#04050a;cursor:pointer;}
+  .vbar{position:absolute;left:0;right:0;bottom:0;height:3px;background:rgba(255,255,255,.07);}
+  .vbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--red-br));transition:width .25s linear;}
+  .replay{
+    position:absolute;right:22px;bottom:24px;padding:10px 20px;
+    border:1px solid rgba(235,230,220,.35);background:rgba(8,8,12,.72);color:var(--ink);
+    font-size:15px;letter-spacing:.2em;cursor:pointer;opacity:0;pointer-events:none;
+    transition:opacity .4s ease, background .3s;
+    backdrop-filter:blur(4px);
+  }
+  .vframe.ended .replay{opacity:1;pointer-events:auto;}
+  .replay:hover{background:rgba(196,59,47,.35);}
+
+  /* ---------- reflow compare ---------- */
+  .cmp{display:grid;grid-template-columns:1fr 84px 1fr;align-items:stretch;gap:0;margin-top:44px;}
+  .cmp .card{
+    border:1px solid var(--line);padding:34px 40px 36px;background:rgba(255,255,255,.017);
+  }
+  .cmp .card.good{border-color:rgba(69,201,166,.30);background:linear-gradient(180deg,rgba(69,201,166,.07),rgba(69,201,166,.01));}
+  .cmp .tag{font-size:15px;letter-spacing:.3em;color:var(--faint);margin-bottom:26px;}
+  .cmp .card.good .tag{color:var(--teal);}
+  .cmp .kv{display:flex;align-items:baseline;gap:16px;margin-bottom:18px;}
+  .cmp .kv .n{font-family:"Cascadia Mono",Consolas,monospace;font-size:52px;font-weight:300;line-height:1;}
+  .cmp .card.good .kv .n{color:var(--teal);}
+  .cmp .kv .t{font-size:17px;color:var(--dim);letter-spacing:.06em;}
+  .cmp .note{font-size:16px;color:var(--faint);line-height:1.7;margin-top:10px;}
+  .cmp .arrow{display:flex;align-items:center;justify-content:center;color:rgba(235,230,220,.30);font-size:30px;}
+
+  /* ---------- chamfer table ---------- */
+  .chamgrid{display:grid;grid-template-columns:1fr 1fr;gap:78px;align-items:start;margin-top:40px;}
+  table.cham{border-collapse:collapse;width:100%;}
+  table.cham th,table.cham td{padding:14px 10px;text-align:center;}
+  table.cham thead th{
+    font-size:15px;font-weight:400;letter-spacing:.2em;color:var(--faint);
+    border-bottom:1px solid var(--line);
+  }
+  table.cham thead th:first-child{text-align:left;padding-left:6px;}
+  table.cham tbody th{
+    text-align:left;padding-left:6px;font-size:19px;font-weight:400;letter-spacing:.1em;color:var(--dim);
+  }
+  table.cham tbody tr:first-child th,table.cham tbody tr:first-child td{border-bottom:1px solid var(--line);}
+  .cell .n{font-family:"Cascadia Mono",Consolas,monospace;font-size:21px;color:#DAD5CC;}
+  .cell .b{height:5px;border-radius:3px;margin-top:9px;background:rgba(255,255,255,.06);overflow:hidden;}
+  .cell .b i{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--red),var(--red-br));}
+  .cell.teal .b i{background:linear-gradient(90deg,#1F8F74,var(--teal));}
+  .cell.hit .n{color:var(--gold);}
+  .cell.hit .b i{box-shadow:0 0 16px rgba(213,178,107,.45);}
+  .takeaways{display:flex;flex-direction:column;gap:18px;}
+  .tk{border-left:2px solid rgba(235,230,220,.16);padding:6px 0 6px 22px;}
+  .tk .h{font-size:16px;letter-spacing:.2em;color:var(--faint);margin-bottom:10px;}
+  .tk .v{font-size:25px;color:#E4DFD6;font-weight:300;line-height:1.5;}
+  .tk .v b{font-family:"Cascadia Mono",Consolas,monospace;color:var(--gold);font-weight:400;}
+  .tk.good{border-left-color:var(--teal);}
+  .tk.good .v b{color:var(--teal);}
+  .tk small{display:block;font-size:14px;color:var(--faint);letter-spacing:.1em;margin-top:8px;}
+
+  .verdict{
+    margin-top:52px;border-top:1px solid var(--line);padding-top:26px;
+    font-size:25px;color:#CFCAC1;font-weight:300;letter-spacing:.03em;
+  }
+  .verdict b{color:var(--gold);font-weight:400;}
+
+  /* ---------- color palette chips ---------- */
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px;}
+  .chip{
+    font-size:14px;letter-spacing:.16em;color:#D9D4CB;padding:8px 14px;
+    border:1px solid var(--line);display:flex;align-items:center;gap:9px;
+  }
+  .chip i{width:9px;height:9px;border-radius:50%;display:block;}
+
+  /* ---------- summary ---------- */
+  .sum{display:flex;flex-direction:column;gap:36px;margin-top:64px;max-width:1250px;}
+  .sum .row{display:grid;grid-template-columns:96px 1fr;gap:30px;align-items:baseline;}
+  .sum .idx{font-family:"Cascadia Mono",Consolas,monospace;font-size:22px;color:var(--red-br);letter-spacing:.1em;}
+  .sum .txt{font-size:34px;font-weight:300;line-height:1.55;color:#DCD7CE;letter-spacing:.02em;}
+  .sum .txt b{color:var(--gold);font-weight:400;}
+  .closing{
+    margin-top:66px;padding-top:34px;border-top:1px solid var(--line);
+    display:flex;justify-content:space-between;align-items:baseline;
+  }
+  .closing .big{font-size:58px;font-weight:200;letter-spacing:.22em;color:#EDE8DF;}
+  .sum-logo{position:absolute;right:-70px;bottom:-190px;width:540px;opacity:.09;pointer-events:none;}
+  .sum-logo img{width:100%;display:block;
+    -webkit-mask-image:radial-gradient(circle, #000 0 2.3px, transparent 2.8px);
+    -webkit-mask-size:9px 9px;
+    mask-image:radial-gradient(circle, #000 0 2.3px, transparent 2.8px);
+    mask-size:9px 9px;}
+  .closing .fin{font-family:"Cascadia Mono",Consolas,monospace;font-size:18px;color:var(--faint);letter-spacing:.14em;}
+  .repo{margin-top:34px;max-width:1250px;}
+  .repo-h{
+    font-family:"Cascadia Mono",Consolas,monospace;font-size:14px;letter-spacing:.2em;
+    color:var(--faint);display:flex;align-items:baseline;gap:16px;
+  }
+  .repo-h span{font-size:12px;letter-spacing:.26em;color:rgba(235,230,220,.28);}
+  .repo-p{margin-top:14px;font-size:20px;font-weight:300;line-height:1.7;color:#A9A49C;letter-spacing:.02em;max-width:1080px;}
+  .repo-p b{color:var(--gold);font-weight:400;}
+  .repo-link{
+    display:inline-block;margin-top:16px;padding-bottom:5px;
+    font-family:"Cascadia Mono",Consolas,monospace;font-size:19px;letter-spacing:.05em;
+    color:var(--teal);text-decoration:none;border-bottom:1px solid rgba(69,201,166,.34);
+    transition:color .2s,border-color .2s;
+  }
+  .repo-link:hover{color:#7FE6CB;border-color:#7FE6CB;}
+
+  /* ---------- notes ---------- */
+  #notes{
+    position:absolute;left:0;right:0;bottom:0;z-index:20;
+    padding:30px 120px 42px;
+    background:linear-gradient(0deg,rgba(5,5,9,.985) 0%,rgba(5,5,9,.94) 62%,rgba(5,5,9,0) 100%);
+    transform:translateY(102%);transition:transform .55s cubic-bezier(.2,.8,.2,1);
+    pointer-events:none;
+  }
+  #notes.open{transform:none;pointer-events:auto;}
+  #notes .nlab{
+    font-size:13px;letter-spacing:.34em;color:var(--red-br);margin-bottom:14px;
+  }
+  #notes .ntext{font-size:21px;line-height:1.8;color:#C8C3BA;font-weight:300;max-width:1600px;}
+  #notes .ntext b{color:var(--gold);font-weight:400;}
+  .notesbtn{
+    position:absolute;right:216px;bottom:34px;z-index:7;
+    border:0;background:transparent;color:rgba(200,195,186,.35);
+    font-size:14px;letter-spacing:.2em;cursor:pointer;font-family:inherit;
+  }
+  .notesbtn:hover{color:rgba(235,230,220,.8);}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="arch" viewBox="0 0 160 130">
+    <g fill="none" stroke="currentColor" stroke-width="12" stroke-linecap="butt">
+      <path d="M12 120 V44 C12 20 44 20 44 44 V120"/>
+      <path d="M64 120 V44 C64 20 96 20 96 44 V120"/>
+      <path d="M116 120 V44 C116 20 148 20 148 44 V120"/>
+    </g>
+  </symbol>
+</svg>
+
+<div id="stage">
+  <div class="bgfx"></div>
+  <div class="vignette"></div>
+
+  <!-- ================= 01 cover ================= -->
+  <section class="slide cover active" data-note="今天讲一个很小的实验：用 Flow Matching 加一次 Reflow，把 8,000 个高斯噪声点，一步映射成湘潭大学校徽中央的三拱门。整个模型 43 万参数。我们先讲清 diffusion 和 flow matching 的区别，再看三段视频。">
+    <div class="cover-left">
+      <div class="kicker anim" style="--d:.05s">FLOW MATCHING · ONCE REFLOW · 433K PARAMS</div>
+      <h1 class="anim" style="--d:.14s">少走弯路</h1>
+      <div class="rule anim" style="--d:.24s"></div>
+      <p class="lead anim" style="--d:.32s">用 <b>Flow Matching</b> 降低扩散模型的迭代次数</p>
+      <p class="sub anim" style="--d:.42s">从 8,000 点高斯噪声，到校徽中央的三拱门</p>
+      <div class="meta anim" style="--d:.54s">
+        <div><b>433,282</b>参数量</div>
+        <div><b>1 步</b>Reflow 之后</div>
+        <div><b>8,000</b>目标点</div>
+      </div>
+    </div>
+    <div class="cover-right">
+      <div class="halo anim" style="--d:.2s"></div>
+      <img class="anim" style="--d:.34s" src="__LOGO__" alt="湘潭大学校徽">
+    </div>
+  </section>
+
+  <!-- ================= 02 diffusion ================= -->
+  <section class="slide" data-note="扩散模型的出发点很朴素：从一个简单的分布出发，比如标准高斯，把它逐步推演成复杂分布。每一次推动就是一个 flow。从噪声到图像的走法有无数种，选哪一种都能训练，差别在于好不好走。">
+    <div class="kicker anim" style="--d:.02s">01 · 扩散模型<span>DIFFUSION</span></div>
+    <h2 class="anim" style="--d:.08s">从噪声，到图案</h2>
+    <div class="split">
+      <div>
+        <p class="lead anim" style="--d:.18s">
+          扩散模型的出发点很朴素：从一个<b>简单的分布</b>出发，
+          把它一步步推演成一个<b>复杂的分布</b>。
+        </p>
+        <ul class="pts">
+          <li class="anim" style="--d:.28s"><b>起点</b>标准高斯分布 —— 也就是随机噪声。</li>
+          <li class="anim" style="--d:.36s"><b>终点</b>一个复杂的分布，比如一张对人眼有意义的图像。</li>
+          <li class="anim" style="--d:.44s"><b>过程</b>学习一个随时间变化的“流”，把每个点搬过去。</li>
+        </ul>
+      </div>
+      <div class="anim" style="--d:.3s">
+        <svg class="dgm" viewBox="0 0 760 620">
+          <defs>
+            <radialGradient id="g2">
+              <stop offset="0" stop-color="#C43B2F" stop-opacity=".26"/>
+              <stop offset="1" stop-color="#C43B2F" stop-opacity="0"/>
+            </radialGradient>
+            <marker id="arw" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="#D5B26B"/>
+            </marker>
+          </defs>
+          <circle cx="556" cy="300" r="240" fill="url(#g2)"/>
+          <g data-cloud="148,310,64,60,280,7"></g>
+          <path d="M262 306 C 330 248, 372 372, 446 308" fill="none" stroke="#D5B26B" stroke-width="1.8" opacity=".75" marker-end="url(#arw)"/>
+          <use href="#arch" x="466" y="222" width="182" height="148" style="color:#D84A3C" opacity=".92"/>
+          <text class="dlabel" x="148" y="452" text-anchor="middle">简单分布 · 高斯噪声</text>
+          <text class="dlabel" x="556" y="452" text-anchor="middle">复杂分布 · 三拱门</text>
+          <text class="dfaint" x="354" y="238" text-anchor="middle">flow</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 03 traditional ================= -->
+  <section class="slide" data-note="传统扩散走的是曲线：数学上是一条微分方程，要用欧拉法一步步积分。步子越多误差越小，但每一步都要问一次网络，所以早期生图很慢。50 步是常态。">
+    <div class="kicker anim" style="--d:.02s">02 · 传统路径<span>CURVED PATH</span></div>
+    <h2 class="anim" style="--d:.08s">曲线，需要一步步走</h2>
+    <div class="split">
+      <div>
+        <p class="lead anim" style="--d:.18s">
+          传统扩散走的是曲线路径。数学上它是一条微分方程，
+          只能用<b>欧拉法</b>这样的数值方法分步积分。
+        </p>
+        <ul class="pts">
+          <li class="anim" style="--d:.28s"><b>每一步</b>都要问一次网络：“现在该往哪走？”</li>
+          <li class="anim" style="--d:.36s"><b>步数越多</b>误差越小，但耗时随步数线性增长。</li>
+          <li class="anim" style="--d:.44s"><b>结果</b>为了质量，早期模型常常要跑几十步。</li>
+        </ul>
+        <div class="bigstat stat anim" style="--d:.54s;margin-top:42px">
+          <div class="num">50<em>步</em></div>
+          <div class="cap">≈ 50 次网络前向</div>
+        </div>
+      </div>
+      <div class="anim" style="--d:.3s">
+        <svg class="dgm" viewBox="0 0 760 620">
+          <g data-cloud="150,470,52,44,190,21"></g>
+          <use href="#arch" x="500" y="66" width="164" height="133" style="color:#7A3029" opacity=".7"/>
+          <path d="M215 455 C 300 470, 330 250, 430 265 S 500 236, 520 242"
+                fill="none" stroke="#4A4A52" stroke-width="1.4" stroke-dasharray="3 6"/>
+          <path d="M215 455 C 300 470, 330 250, 430 265 S 500 236, 520 242"
+                fill="none" stroke="#D5B26B" stroke-width="12" stroke-linecap="round"
+                stroke-dasharray="0.1 64" opacity=".95"/>
+          <path d="M215 455 C 300 470, 330 250, 430 265 S 500 236, 520 242"
+                fill="none" stroke="#D5B26B" stroke-width="1.1" opacity=".18"/>
+          <text class="dcode" x="196" y="512">x₀ · t=0</text>
+          <text class="dcode" x="532" y="292">x₁ · t=1</text>
+          <text class="dfaint" x="330" y="404">Euler 分步</text>
+          <text class="dfaint" x="88" y="540">噪声</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 04 flow matching ================= -->
+  <section class="slide" data-note="2022 年的 Flow Matching 换了个思路：别绕曲线，直接用直线连接起点和终点。x_t 是两端的线性插值，速度 v 等于 x1 减 x0，是常数。配对足够好时，一步欧拉更新就能到终点。">
+    <div class="kicker anim" style="--d:.02s">03 · FLOW MATCHING<span>2022</span></div>
+    <h2 class="anim" style="--d:.08s">用直线，重写路径</h2>
+    <div class="split" style="grid-template-columns:1.04fr .96fr">
+      <div>
+        <p class="lead anim" style="--d:.18s">
+          2022 年的 Flow Matching 换了一种构造：
+          不绕曲线，直接用<b>直线</b>连接起点和终点。
+        </p>
+        <div class="formula anim" style="--d:.26s">
+          <div class="f1">x<sub>t</sub> = (1 − t)·x<sub>0</sub> + t·x<sub>1</sub></div>
+          <div class="f2">v = x<sub>1</sub> − x<sub>0</sub>　（恒定）</div>
+          <div class="fnote">终点固定，方向恒定，网络只学“往哪走”</div>
+        </div>
+        <ul class="pts">
+          <li class="anim" style="--d:.36s"><b>一对点</b>定义一条直线，和一个恒定的速度。</li>
+          <li class="anim" style="--d:.44s"><b>一次欧拉更新</b>配对足够好时，一步就能到达。</li>
+        </ul>
+      </div>
+      <div class="anim" style="--d:.3s">
+        <svg class="dgm" viewBox="0 0 760 620">
+          <g data-cloud="150,470,52,44,190,21"></g>
+          <use href="#arch" x="500" y="66" width="164" height="133" style="color:#7A3029" opacity=".7"/>
+          <g stroke="#8B887F" stroke-width=".9" opacity=".28">
+            <line x1="140" y1="440" x2="558" y2="216"/>
+            <line x1="186" y1="500" x2="556" y2="236"/>
+            <line x1="176" y1="428" x2="600" y2="230"/>
+            <line x1="120" y1="492" x2="536" y2="198"/>
+          </g>
+          <line x1="215" y1="455" x2="512" y2="242" stroke="#D5B26B" stroke-width="12"
+                stroke-linecap="round" stroke-dasharray="0.1 62" opacity=".95"/>
+          <line x1="215" y1="455" x2="512" y2="242" stroke="#D5B26B" stroke-width="1.2" opacity=".22"/>
+          <g transform="translate(360,349) rotate(-35.7)" fill="none" stroke="#D5B26B" stroke-width="2.2" opacity=".85">
+            <path d="M-7 -7 L7 0 L-7 7"/>
+          </g>
+          <text class="dcode" x="196" y="512">x₀ · t=0</text>
+          <text class="dcode" x="532" y="292">x₁ · t=1</text>
+          <text class="dfaint" x="400" y="300">v</text>
+        </svg>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 05 experiment ================= -->
+  <section class="slide" data-note="我们做了个极小的实验来验证：目标图形上撒 8,000 个点，起点是同数量的高斯噪声；网络是 5 层、每层 320 个神经元的 MLP，总共 433,282 个参数。每轮随机配对，让网络学从这到那的方向。">
+    <div class="kicker anim" style="--d:.02s">04 · 实验设置<span>SETUP</span></div>
+    <h2 class="anim" style="--d:.08s">一个不到 1M 参数的小模型</h2>
+    <p class="lead anim" style="--d:.16s;max-width:1250px">
+      为了看清方法本身，我们把问题压到最小：二维点云、几百 KB 的模型、几分钟的训练。
+    </p>
+    <div class="setgrid">
+      <div class="spec anim" style="--d:.26s">
+        <div class="row"><div class="k">起点</div><div class="v">8,000 点 · 标准高斯噪声</div></div>
+        <div class="row"><div class="k">终点</div><div class="v">8,000 点 · 三拱门轮廓</div></div>
+        <div class="row"><div class="k">网络</div><div class="v">VelocityMLP · <b>320</b> 宽 × <b>5</b> 层</div></div>
+        <div class="row"><div class="k">参数量</div><div class="v"><b>433,282</b></div></div>
+        <div class="row"><div class="k">训练</div><div class="v"><b>2 × 12,000</b> 步 · batch <b>8,192</b> · lr <b>2e-3</b></div></div>
+        <div class="row"><div class="k">Reflow</div><div class="v"><b>32,000</b> 对重新配对</div></div>
+      </div>
+      <div class="mlpwrap anim" style="--d:.36s">
+        <svg class="dgm" viewBox="0 0 760 470">
+          <defs>
+            <radialGradient id="g5">
+              <stop offset="0" stop-color="#C43B2F" stop-opacity=".18"/>
+              <stop offset="1" stop-color="#C43B2F" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <circle cx="380" cy="240" r="330" fill="url(#g5)"/>
+          <g id="mlpEdges" stroke="#93AEE0" stroke-width=".8" opacity=".13"></g>
+          <g id="mlpNodes"></g>
+          <text class="dlabel" x="70" y="432" text-anchor="middle">输入 x₀</text>
+          <text class="dlabel" x="380" y="432" text-anchor="middle">隐藏层 320 × 5</text>
+          <text class="dlabel" x="700" y="432" text-anchor="middle">输出 v</text>
+        </svg>
+        <div class="cap"><b>2 → 320 × 5 → 2</b>　·　433,282 参数</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 06 crossing video ================= -->
+  <section class="slide vslide" data-video="0" data-note="随机配对会出问题：8000 个点两两配对，直线在空间里大量相交，约 21% 的线会和别的线交叉。交叉点附近，模型同时看到好几个方向，只能加权平均——于是轨迹被拉弯了。画面里橙色是弯曲后的真实轨迹，白色是原本的直线。">
+    <div class="vcol">
+      <div class="kicker anim" style="--d:.02s">05 · 第一次训练<span>1-RF</span></div>
+      <h2 class="anim" style="--d:.08s">随机连线<br>会交叉</h2>
+      <p class="lead anim" style="--d:.16s">
+        随机配对的直线在空间里大量相交。交叉点处，模型同时看到多个方向，只能取<b>加权平均</b>。
+      </p>
+      <ul class="pts">
+        <li class="anim" style="--d:.24s">橙色：被拉弯后的真实轨迹</li>
+        <li class="anim" style="--d:.30s">白色：原本的直线</li>
+      </ul>
+      <div class="bigstat stat anim" style="--d:.36s">
+        <div class="num">21.43<em>%</em></div>
+        <div class="cap">随机配对的交叉率</div>
+      </div>
+    </div>
+    <div class="vframe anim" style="--d:.2s">
+      <video muted playsinline preload="none" disablepictureinpicture></video>
+      <div class="vbar"><i></i></div>
+      <button class="replay">重播 ↻</button>
+    </div>
+  </section>
+
+  <!-- ================= 07 reflow ================= -->
+  <section class="slide" data-note="解决办法是 reflow：先用训练好的模型完整走一遍，记录每个点的真实轨迹，再用轨迹端点重新配对。配对不再是随机的，交叉率从 21.43% 降到 0.25%，平均绕路从 58.7% 降到 0.0079%。">
+    <div class="kicker anim" style="--d:.02s">06 · REFLOW<span>ONE MORE PASS</span></div>
+    <h2 class="anim" style="--d:.08s">把交叉，重新配对掉</h2>
+    <p class="lead anim" style="--d:.16s;max-width:1400px">
+      先用训练好的模型完整走一遍，记录每个点的真实轨迹；再用轨迹端点重新配对。
+      配对不再是随机的，路径自己教会自己走直线。
+    </p>
+    <div class="cmp">
+      <div class="card anim" style="--d:.26s">
+        <div class="tag">随机配对 · 1-RF</div>
+        <div class="kv"><div class="n">21.43%</div><div class="t">直线交叉率</div></div>
+        <div class="kv"><div class="n">+58.7%</div><div class="t">平均多绕的路程</div></div>
+        <div class="note">交叉点处的速度被平均，轨迹弯了，一步走不到终点。</div>
+      </div>
+      <div class="arrow anim" style="--d:.34s">→</div>
+      <div class="card good anim" style="--d:.34s">
+        <div class="tag">REFLOW 配对 · 2-RF</div>
+        <div class="kv"><div class="n">0.25%</div><div class="t">直线交叉率</div></div>
+        <div class="kv"><div class="n">+0.0079%</div><div class="t">平均多绕的路程</div></div>
+        <div class="note">路径近乎笔直，一步欧拉更新即可落到目标。</div>
+      </div>
+    </div>
+    <p class="lead anim" style="--d:.44s;margin-top:40px;font-size:20px;color:var(--faint)">
+      同样 8,000 个点、同样的网络，只换配对方式。
+    </p>
+  </section>
+
+  <!-- ================= 08 comparison video ================= -->
+  <section class="slide vslide" data-video="1" data-note="这是两组对比。左边是第一次训练的模型：1 步只是一个点团，2、4、10 步慢慢张开，50 步才成形。右边是 reflow 之后的模型：同样的网络、同样的数据，1 步就直接是三拱门。步数标注在画面左下角。">
+    <div class="vcol">
+      <div class="kicker anim" style="--d:.02s">07 · 少步对比<span>1-RF VS 2-RF</span></div>
+      <h2 class="anim" style="--d:.08s">50 步，<br>还是 1 步</h2>
+      <p class="lead anim" style="--d:.16s">
+        左边是第一次训练的模型：1 步只是一个点团，步数加上去才慢慢张开。
+        右边是 reflow 之后的模型：同样 1 步，直接落到三拱门。
+      </p>
+      <ul class="pts">
+        <li class="anim" style="--d:.24s">左：1 / 2 / 4 / 10 / 50 步</li>
+        <li class="anim" style="--d:.30s">右：1 步</li>
+      </ul>
+      <div class="bigstat stat anim" style="--d:.36s">
+        <div class="num">50<em>→</em>1</div>
+        <div class="cap">达到同等效果所需步数</div>
+      </div>
+    </div>
+    <div class="vframe anim" style="--d:.2s">
+      <video muted playsinline preload="none" disablepictureinpicture></video>
+      <div class="vbar"><i></i></div>
+      <button class="replay">重播 ↻</button>
+    </div>
+  </section>
+
+  <!-- ================= 09 chamfer ================= -->
+  <section class="slide" data-note="用 Chamfer 距离量化：1-RF 从 0.574 一路降到 0.0151，需要 50 步；2-RF 第 1 步就是 0.0173，已经接近 1-RF 跑满 50 步的结果。继续加步数几乎没有收益。">
+    <div class="kicker anim" style="--d:.02s">08 · 量化<span>CHAMFER DISTANCE</span></div>
+    <h2 class="anim" style="--d:.08s">用 Chamfer 距离看差距</h2>
+    <p class="lead anim" style="--d:.16s;max-width:1400px">
+      Chamfer 距离衡量两组点云的平均最近邻距离，越小越接近目标。横轴是采样步数。
+    </p>
+    <div class="chamgrid">
+      <div class="anim" style="--d:.24s">
+        <table class="cham">
+          <thead>
+            <tr><th>步数</th><th>1</th><th>2</th><th>4</th><th>10</th><th>50</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th>1-RF</th>
+              <td class="cell"><div class="n">0.5742</div><div class="b"><i style="--w:100%"></i></div></td>
+              <td class="cell"><div class="n">0.1722</div><div class="b"><i style="--w:30%"></i></div></td>
+              <td class="cell"><div class="n">0.0580</div><div class="b"><i style="--w:10.1%"></i></div></td>
+              <td class="cell"><div class="n">0.0279</div><div class="b"><i style="--w:4.9%"></i></div></td>
+              <td class="cell hit"><div class="n">0.0151</div><div class="b"><i style="--w:2.6%"></i></div></td>
+            </tr>
+            <tr>
+              <th>2-RF</th>
+              <td class="cell teal hit"><div class="n">0.0173</div><div class="b"><i style="--w:3%"></i></div></td>
+              <td class="cell teal"><div class="n">0.0160</div><div class="b"><i style="--w:2.8%"></i></div></td>
+              <td class="cell teal"><div class="n">0.0155</div><div class="b"><i style="--w:2.7%"></i></div></td>
+              <td class="cell teal"><div class="n">0.0152</div><div class="b"><i style="--w:2.65%"></i></div></td>
+              <td class="cell teal"><div class="n">0.0151</div><div class="b"><i style="--w:2.63%"></i></div></td>
+            </tr>
+          </tbody>
+        </table>
+        <div style="font-size:14px;letter-spacing:.14em;color:var(--faint);margin-top:26px">柱长按数值线性缩放 · 越小越好</div>
+      </div>
+      <div class="takeaways">
+        <div class="tk anim" style="--d:.32s">
+          <div class="h">1-RF · 跑满 50 步</div>
+          <div class="v"><b>0.0151</b></div>
+        </div>
+        <div class="tk good anim" style="--d:.40s">
+          <div class="h">2-RF · 只要 1 步</div>
+          <div class="v"><b>0.0173</b><small>已经接近 1-RF 跑满 50 步的结果</small></div>
+        </div>
+        <div class="tk anim" style="--d:.48s">
+          <div class="h">2-RF · 继续加步数</div>
+          <div class="v"><b>0.0151</b><small>几乎没有收益，1 步就够了</small></div>
+        </div>
+      </div>
+    </div>
+    <div class="verdict anim" style="--d:.56s">2-RF 用 <b>1 步</b>，达到 1-RF 跑满 <b>50 步</b> 的精度。</div>
+  </section>
+
+  <!-- ================= 10 color video ================= -->
+  <section class="slide vslide" data-video="2" data-note="最后是上色。我们保留了原图每个点的亮度，用同一套“亮度到颜色”的查找表，同时给底噪和三拱门染色，于是可以整块切换色板：湘大红、暖橙、鎏金、翠绿、青碧、靛蓝、紫罗兰。这是应用展示，说明点云可以带着语义颜色。">
+    <div class="vcol">
+      <div class="kicker anim" style="--d:.02s">09 · 上色<span>GRAYSCALE LUT</span></div>
+      <h2 class="anim" style="--d:.08s">同一套灰度<br>染上校徽的颜色</h2>
+      <p class="lead anim" style="--d:.16s">
+        每个点保留原图对应位置的亮度。用一张“亮度 → 颜色”的查找表，
+        同时给底噪与三拱门染色，就能整块切换色板。
+      </p>
+      <div class="chips anim" style="--d:.26s">
+        <span class="chip"><i style="background:#B0362C"></i>湘大红</span>
+        <span class="chip"><i style="background:#E07A2A"></i>暖橙</span>
+        <span class="chip"><i style="background:#D9A83C"></i>鎏金</span>
+        <span class="chip"><i style="background:#3FA96B"></i>翠绿</span>
+        <span class="chip"><i style="background:#2FB6AE"></i>青碧</span>
+        <span class="chip"><i style="background:#4A7BD0"></i>靛蓝</span>
+        <span class="chip"><i style="background:#8A63C8"></i>紫罗兰</span>
+      </div>
+    </div>
+    <div class="vframe anim" style="--d:.2s">
+      <video muted playsinline preload="none" disablepictureinpicture></video>
+      <div class="vbar"><i></i></div>
+      <button class="replay">重播 ↻</button>
+    </div>
+  </section>
+
+  <!-- ================= 11 summary ================= -->
+  <section class="slide" data-note="三句话：扩散的本质是学一个流；Flow Matching 用直线把路径变短；一次 Reflow 把交叉去掉，1 步就够了。43 万参数、1 步、Chamfer 0.0173。最后，有兴趣一起研究深度学习的同学可以随时找我，源码、模型和数据都开源在仓库里，有需要自取，觉得不错点个 star。谢谢大家。">
+    <div class="sum-logo"><img src="__LOGO__" alt=""></div>
+    <div class="kicker anim" style="--d:.02s">10 · 总结<span>SUMMARY</span></div>
+    <h2 class="anim" style="--d:.08s">少走弯路</h2>
+    <div class="sum">
+      <div class="row anim" style="--d:.18s"><div class="idx">01</div><div class="txt">扩散的本质，是学一个从噪声到图像的<b>流</b>。</div></div>
+      <div class="row anim" style="--d:.28s"><div class="idx">02</div><div class="txt">Flow Matching 用<b>直线</b>构造路径，把路走短。</div></div>
+      <div class="row anim" style="--d:.38s"><div class="idx">03</div><div class="txt">一次 <b>Reflow</b> 消除交叉，<b>1 步</b>就能成形。</div></div>
+    </div>
+    <div class="closing anim" style="--d:.5s">
+      <div class="big">直线也是一种答案</div>
+      <div class="fin">433,282 params · 1 step · chamfer 0.0173</div>
+    </div>
+    <div class="repo anim" style="--d:.62s">
+      <div class="repo-h">源码 · 模型 · 数据<span>OPEN SOURCE</span></div>
+      <div class="repo-p">有兴趣一起研究深度学习，随时<b>喊我</b>。脚本、模型权重、点云数据和全部导出工具都放在这个仓库里，有需要自取；觉得还不错，点个 <b>star</b> 喵。</div>
+      <a class="repo-link" href="__REPO__" target="_blank" rel="noopener">__REPO_SHORT__ ↗</a>
+    </div>
+  </section>
+
+  <!-- chrome -->
+  <div class="brand">湘潭大学 · LOGO DIFFUSION</div>
+  <div class="counter"><b id="cnum">01</b> / 11</div>
+  <div class="dots" id="dots"></div>
+  <button class="navbtn prev" id="prev" aria-label="上一页">‹</button>
+  <button class="navbtn next" id="next" aria-label="下一页">›</button>
+  <div class="hint" id="hint">← → 翻页　·　F 全屏　·　N 讲稿</div>
+  <button class="notesbtn" id="notesbtn">讲稿 N</button>
+  <div id="notes"><div class="nlab">讲稿</div><div class="ntext" id="ntext"></div></div>
+</div>
+
+<script id="b64-v1" type="text/plain">__VIDEO1__</script>
+<script id="b64-v2" type="text/plain">__VIDEO2__</script>
+<script id="b64-v3" type="text/plain">__VIDEO3__</script>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- fit stage ---------- */
+  var stage = document.getElementById('stage');
+  function fit() {
+    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    stage.style.transform = 'translate(-50%,-50%) scale(' + s + ')';
+  }
+  fit();
+  window.addEventListener('resize', fit);
+
+  /* ---------- gaussian dot clouds in svg ---------- */
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  function gauss(rnd) {
+    var u = 0, v = 0;
+    while (!u) u = rnd();
+    while (!v) v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  document.querySelectorAll('g[data-cloud]').forEach(function (g) {
+    var p = g.getAttribute('data-cloud').split(',').map(Number);
+    var cx = p[0], cy = p[1], sx = p[2], sy = p[3], n = p[4], seed = p[5];
+    var rnd = mulberry32(seed);
+    for (var i = 0; i < n; i++) {
+      var c = document.createElementNS(SVGNS, 'circle');
+      c.setAttribute('cx', (cx + gauss(rnd) * sx).toFixed(1));
+      c.setAttribute('cy', (cy + gauss(rnd) * sy).toFixed(1));
+      c.setAttribute('r', (0.9 + rnd() * 1.4).toFixed(2));
+      c.setAttribute('fill', '#A9C3EE');
+      c.setAttribute('opacity', (0.10 + rnd() * 0.52).toFixed(2));
+      g.appendChild(c);
+    }
+  });
+
+  /* ---------- mlp schematic ---------- */
+  (function () {
+    var edges = document.getElementById('mlpEdges');
+    var nodes = document.getElementById('mlpNodes');
+    if (!edges) return;
+    var xs = [70, 194, 318, 442, 566, 700];
+    var counts = [2, 7, 7, 7, 7, 2];
+    var pts = xs.map(function (x, li) {
+      var n = counts[li], arr = [];
+      var gap = n > 2 ? 54 : 96;
+      for (var i = 0; i < n; i++) arr.push([x, 240 + (i - (n - 1) / 2) * gap]);
+      return arr;
+    });
+    for (var li = 0; li < 5; li++) {
+      pts[li].forEach(function (a) {
+        pts[li + 1].forEach(function (b) {
+          var l = document.createElementNS(SVGNS, 'line');
+          l.setAttribute('x1', a[0]); l.setAttribute('y1', a[1]);
+          l.setAttribute('x2', b[0]); l.setAttribute('y2', b[1]);
+          edges.appendChild(l);
+        });
+      });
+    }
+    pts.forEach(function (layer, li) {
+      layer.forEach(function (p) {
+        var c = document.createElementNS(SVGNS, 'circle');
+        c.setAttribute('cx', p[0]); c.setAttribute('cy', p[1]); c.setAttribute('r', 7);
+        if (li === 0 || li === 5) {
+          c.setAttribute('fill', li === 0 ? '#C43B2F' : '#D5B26B');
+          c.setAttribute('stroke', 'rgba(255,255,255,.35)');
+        } else {
+          c.setAttribute('fill', '#0D0F16');
+          c.setAttribute('stroke', 'rgba(150,180,235,.55)');
+        }
+        c.setAttribute('stroke-width', '1.4');
+        nodes.appendChild(c);
+      });
+    });
+  })();
+
+  /* ---------- slides ---------- */
+  var slides = Array.prototype.slice.call(document.querySelectorAll('.slide'));
+  var dotsEl = document.getElementById('dots');
+  var cnum = document.getElementById('cnum');
+  var ntext = document.getElementById('ntext');
+  var notesEl = document.getElementById('notes');
+  var hint = document.getElementById('hint');
+  var cur = 0;
+  var b64Ids = ['b64-v1', 'b64-v2', 'b64-v3'];
+
+  slides.forEach(function (s, i) {
+    var d = document.createElement('button');
+    d.className = 'dot';
+    d.setAttribute('aria-label', '第 ' + (i + 1) + ' 页');
+    d.addEventListener('click', function () { go(i); });
+    dotsEl.appendChild(d);
+  });
+  var dotEls = Array.prototype.slice.call(dotsEl.children);
+
+  function loadVideo(v, idx) {
+    if (v.dataset.ready) return;
+    var b64 = document.getElementById(b64Ids[idx]).textContent.trim();
+    var bin = atob(b64);
+    var u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    var url = URL.createObjectURL(new Blob([u8], { type: 'video/mp4' }));
+    v.src = url;
+    v.dataset.ready = '1';
+    v.load();
+  }
+
+  function videoOf(slide) { return slide.querySelector('video'); }
+
+  function go(i) {
+    i = Math.max(0, Math.min(slides.length - 1, i));
+    if (i === cur) return;
+    var old = slides[cur];
+    old.classList.remove('active');
+    var ov = videoOf(old);
+    if (ov) {
+      ov.pause();
+      try { ov.currentTime = 0; } catch (e) {}
+      ov.parentElement.classList.remove('ended');
+      var ob = ov.parentElement.querySelector('.vbar i');
+      if (ob) ob.style.width = '0%';
+    }
+
+    cur = i;
+    var s = slides[cur];
+    s.classList.add('active');
+    cnum.textContent = String(cur + 1).padStart(2, '0');
+    dotEls.forEach(function (d, k) { d.classList.toggle('on', k === cur); });
+    ntext.textContent = s.getAttribute('data-note') || '';
+    if (cur > 0) hint.style.opacity = '0';
+
+    var v = videoOf(s);
+    if (v) {
+      loadVideo(v, Number(s.getAttribute('data-video')));
+      v.parentElement.classList.remove('ended');
+      setTimeout(function () {
+        if (cur === i) {
+          var pl = v.play();
+          if (pl && pl.catch) pl.catch(function () {});
+        }
+      }, 520);
+    }
+  }
+
+  function next() { go(cur + 1); }
+  function prev() { go(cur - 1); }
+
+  document.getElementById('next').addEventListener('click', next);
+  document.getElementById('prev').addEventListener('click', prev);
+
+  /* video interactions */
+  Array.prototype.forEach.call(document.querySelectorAll('.vframe'), function (frame) {
+    var v = frame.querySelector('video');
+    var bar = frame.querySelector('.vbar i');
+    var replay = frame.querySelector('.replay');
+    v.addEventListener('timeupdate', function () {
+      if (v.duration && bar) bar.style.width = (v.currentTime / v.duration * 100) + '%';
+    });
+    v.addEventListener('ended', function () { frame.classList.add('ended'); });
+    v.addEventListener('play', function () { frame.classList.remove('ended'); });
+    v.addEventListener('click', function () {
+      if (v.paused) { v.play().catch(function () {}); }
+      else { v.pause(); }
+    });
+    replay.addEventListener('click', function (e) {
+      e.stopPropagation();
+      v.currentTime = 0;
+      v.play().catch(function () {});
+    });
+  });
+
+  /* notes */
+  function toggleNotes() { notesEl.classList.toggle('open'); }
+  document.getElementById('notesbtn').addEventListener('click', toggleNotes);
+
+  /* keyboard */
+  document.addEventListener('keydown', function (e) {
+    var k = e.key;
+    if (k === 'ArrowRight' || k === 'ArrowDown' || k === 'PageDown' || k === ' ') {
+      e.preventDefault(); next();
+    } else if (k === 'ArrowLeft' || k === 'ArrowUp' || k === 'PageUp') {
+      e.preventDefault(); prev();
+    } else if (k === 'Home') {
+      e.preventDefault(); go(0);
+    } else if (k === 'End') {
+      e.preventDefault(); go(slides.length - 1);
+    } else if (k === 'f' || k === 'F') {
+      if (!document.fullscreenElement) {
+        if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen();
+      } else if (document.exitFullscreen) {
+        document.exitFullscreen();
+      }
+    } else if (k === 'n' || k === 'N') {
+      toggleNotes();
+    }
+  });
+
+  /* init */
+  cnum.textContent = '01';
+  dotEls[0].classList.add('on');
+  ntext.textContent = slides[0].getAttribute('data-note') || '';
+
+  window.__go = go;
+  window.__deckReady = true;
+})();
+</script>
+</body>
+</html>

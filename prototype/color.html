@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>灰度 LUT · 色板染色</title>
+<style>
+  :root { --bg:#04050a; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden; }
+  body { font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; }
+  #stage { position:fixed; inset:0; }
+  canvas { display:block; }
+  #caption {
+    position:fixed; left:50%; bottom:64px; transform:translateX(-50%);
+    text-align:center; pointer-events:none; white-space:nowrap;
+  }
+  #pname {
+    display:block; font-size:26px; font-weight:300; letter-spacing:.42em;
+    color:rgba(232,240,255,.92); text-shadow:0 0 26px rgba(140,170,255,.35);
+  }
+  #psub {
+    display:block; margin-top:10px; font-size:11px; letter-spacing:.30em;
+    color:rgba(150,165,205,.62);
+  }
+  #err { position:fixed; left:0; top:0; z-index:99; color:#ff5a5a;
+         font:12px monospace; white-space:pre-wrap; padding:8px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="err"></div>
+<div id="stage"></div>
+<div id="caption">
+  <span id="pname">灰度 LUT</span>
+  <span id="psub">同一套灰度映射 · 底噪与图案同步着色</span>
+</div>
+
+<script>
+(function () {
+  window.addEventListener('error', e => {
+    document.getElementById('err').textContent +=
+      'ERROR: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0) + '\n';
+  });
+})();
+</script>
+<script src="./color_data.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const C = window.COLOR;
+if (!C) throw new Error('COLOR data missing');
+
+function b64bytes(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function decodeI16(b64, scale) {
+  const q = new Int16Array(b64bytes(b64).buffer);
+  const out = new Float32Array(q.length);
+  for (let i = 0; i < q.length; i++) out[i] = q[i] / scale;
+  return out;
+}
+const decodeF32 = b64 => new Float32Array(b64bytes(b64).buffer);
+
+const SCALE = C.scale, N = C.n;
+const x0 = decodeI16(C.x0, SCALE);
+const target = decodeI16(C.target, SCALE);
+const light = decodeF32(C.light);
+
+const Z0 = 0.0, Z1 = 1.7;
+
+/* ---------------- renderer ---------------- */
+const W = 1920, HGT = 1080;
+const stage = document.getElementById('stage');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04050a);
+scene.fog = new THREE.FogExp2(0x04050a, 0.016);
+
+const camera = new THREE.PerspectiveCamera(42, W / HGT, 0.05, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(W, HGT);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.10;
+stage.appendChild(renderer.domElement);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, HGT), 0.62, 0.50, 0.42));
+composer.addPass(new OutputPass());
+
+/* ---------------- sprite ---------------- */
+function makeSprite() {
+  const s = 64, c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.32, 'rgba(255,255,255,0.85)');
+  g.addColorStop(0.7, 'rgba(255,255,255,0.16)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sprite = makeSprite();
+
+/* ---------------- point clouds ---------------- */
+function makeCloud(xy, z, size, opacity, blending) {
+  const pos = new Float32Array(N * 3);
+  const col = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    pos[3*i] = xy[2*i];
+    pos[3*i+1] = xy[2*i+1];
+    pos[3*i+2] = z;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const mat = new THREE.PointsMaterial({
+    size, map: sprite, vertexColors: true, transparent: true, opacity,
+    depthWrite: false, blending, sizeAttenuation: true,
+  });
+  const obj = new THREE.Points(geo, mat);
+  scene.add(obj);
+  return { obj, geo, mat, col };
+}
+const source = makeCloud(x0, Z0, 0.050, 0.0, THREE.AdditiveBlending);
+const targetCloud = makeCloud(target, Z1, 0.060, 0.0, THREE.NormalBlending);
+
+/* ---------------- palettes ---------------- */
+function makeRamp(stops) {
+  const s = stops.map(([u, c]) => [u, c]);
+  return function (u) {
+    u = Math.max(0, Math.min(1, u));
+    for (let i = 1; i < s.length; i++) {
+      if (u <= s[i][0]) {
+        const [u0, c0] = s[i - 1], [u1, c1] = s[i];
+        return c0.clone().lerp(c1, (u - u0) / (u1 - u0 || 1));
+      }
+    }
+    return s[s.length - 1][1].clone();
+  };
+}
+const hsl = (h, s, l) => new THREE.Color().setHSL(h, s, l);
+
+function hueRamp(h) {
+  return makeRamp([
+    [0.00, hsl(h, 0.85, 0.035)],
+    [0.28, hsl(h, 0.95, 0.19)],
+    [0.55, hsl(h, 0.98, 0.45)],
+    [0.78, hsl(h, 0.88, 0.68)],
+    [1.00, hsl(h, 0.50, 0.92)],
+  ]);
+}
+
+const GRAY = makeRamp([
+  [0.00, new THREE.Color(0x141414)],
+  [0.45, new THREE.Color(0x747474)],
+  [0.75, new THREE.Color(0xc2c2c2)],
+  [1.00, new THREE.Color(0xf8f8f8)],
+]);
+
+const PALETTES = [
+  { name: '湘大红', ramp: hueRamp(0.985) },
+  { name: '暖橙',   ramp: hueRamp(0.055) },
+  { name: '鎏金',   ramp: hueRamp(0.115) },
+  { name: '翠绿',   ramp: hueRamp(0.340) },
+  { name: '青碧',   ramp: hueRamp(0.480) },
+  { name: '靛蓝',   ramp: hueRamp(0.600) },
+  { name: '紫罗兰', ramp: hueRamp(0.760) },
+  { name: '湘大红', ramp: hueRamp(0.985) },
+];
+
+/* ---------------- hash ---------------- */
+function hash(i) {
+  let x = (i * 374761393 + 668265263) | 0;
+  x = Math.imul(x ^ (x >>> 13), 1274126177);
+  return ((x ^ (x >>> 16)) >>> 0) / 4294967295;
+}
+
+const clamp01 = v => Math.max(0, Math.min(1, v));
+const smooth = v => { v = clamp01(v); return v * v * (3 - 2 * v); };
+
+/* ---------------- color update ---------------- */
+function updateColors(rampA, rampB, mix) {
+  const tc = targetCloud.col, sc = source.col;
+  for (let i = 0; i < N; i++) {
+    let u = clamp01((light[i] - 0.32) / 0.60 + (hash(i) - 0.5) * 0.10);
+    const ct = rampA(u).lerp(rampB(u), mix);
+    tc[3*i] = ct.r; tc[3*i+1] = ct.g; tc[3*i+2] = ct.b;
+
+    const us = 0.09 + hash(i + 9001) * 0.26;
+    const cs = rampA(us).lerp(rampB(us), mix);
+    sc[3*i] = cs.r * 0.85; sc[3*i+1] = cs.g * 0.85; sc[3*i+2] = cs.b * 0.85;
+  }
+  targetCloud.geo.attributes.color.needsUpdate = true;
+  source.geo.attributes.color.needsUpdate = true;
+}
+
+/* ---------------- palette timeline ---------------- */
+function paletteAt(t) {
+  if (t < 0.10) return { a: GRAY, b: GRAY, mix: 0, name: '灰度 LUT' };
+  if (t < 0.18) {
+    const k = smooth((t - 0.10) / 0.08);
+    return { a: GRAY, b: PALETTES[0].ramp, mix: k, name: k < 0.55 ? '灰度 LUT' : PALETTES[0].name };
+  }
+  const u = clamp01((t - 0.18) / 0.62);
+  const f = u * (PALETTES.length - 1);
+  const i = Math.min(PALETTES.length - 2, Math.floor(f));
+  const frac = smooth(f - i);
+  return {
+    a: PALETTES[i].ramp, b: PALETTES[i + 1].ramp, mix: frac,
+    name: frac < 0.5 ? PALETTES[i].name : PALETTES[i + 1].name,
+  };
+}
+
+/* ---------------- camera ---------------- */
+const YAW0 = 0.70, PITCH = 0.38;
+
+function setCamera(t) {
+  const e = smooth(t);
+  const dist = 7.6 - 1.2 * e;
+  const lookZ = 0.80 + 0.10 * e;
+  const yaw = YAW0 + 0.05 * Math.sin(t * Math.PI * 2);
+  const dx = Math.cos(PITCH) * Math.sin(yaw);
+  const dy = Math.sin(PITCH);
+  const dz = Math.cos(PITCH) * Math.cos(yaw);
+  camera.position.set(dx * dist, dy * dist, dz * dist + lookZ);
+  camera.lookAt(0, 0, lookZ);
+}
+
+/* ---------------- timeline ---------------- */
+const pname = document.getElementById('pname');
+
+function applyT(t) {
+  t = clamp01(t);
+  setCamera(t);
+
+  const pal = paletteAt(t);
+  updateColors(pal.a, pal.b, pal.mix);
+  if (pname.textContent !== pal.name) pname.textContent = pal.name;
+
+  const inA = smooth(t / 0.08);
+  source.mat.opacity = inA * 0.52;
+  targetCloud.mat.opacity = inA * 0.92;
+
+  renderFrame();
+}
+
+function renderFrame() {
+  composer.render();
+}
+
+/* ---------------- boot ---------------- */
+const params = new URLSearchParams(location.search);
+const tParam = params.get('t');
+
+if (tParam !== null) {
+  applyT(parseFloat(tParam) || 0);
+  document.documentElement.dataset.boot = 'ready';
+} else {
+  const DURATION = 12;
+  const start = performance.now();
+  function tick(now) {
+    const t = clamp01((now - start) / 1000 / DURATION);
+    applyT(t);
+    if (t < 1) requestAnimationFrame(tick);
+    else document.documentElement.dataset.boot = 'ready';
+  }
+  requestAnimationFrame(tick);
+  document.documentElement.dataset.boot = 'playing';
+}
+
+window.__seek = function (t) {
+  applyT(t);
+  return true;
+};
+window.__ready = true;
+</script>
+</body>
+</html>

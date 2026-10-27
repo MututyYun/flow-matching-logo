@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1-RF · 交叉点平均与轨迹弯曲</title>
+<style>
+  :root { --bg:#04050a; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); overflow:hidden; }
+  #stage { position:fixed; inset:0; }
+  canvas { display:block; }
+  #err { position:fixed; left:0; top:0; z-index:99; color:#ff5a5a;
+         font:12px monospace; white-space:pre-wrap; padding:8px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="err"></div>
+<div id="stage"></div>
+
+<script>
+(function () {
+  window.addEventListener('error', e => {
+    document.getElementById('err').textContent +=
+      'ERROR: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0) + '\n';
+  });
+  window.addEventListener('unhandledrejection', e => {
+    document.getElementById('err').textContent +=
+      'REJECT: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason) + '\n';
+  });
+})();
+</script>
+<script src="./cross_data.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+const C = window.CROSS;
+if (!C) throw new Error('CROSS data missing');
+
+/* ---------------- decode ---------------- */
+function b64bytes(b64) {
+  const bin = atob(b64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8;
+}
+function decodeI16(b64, scale) {
+  const q = new Int16Array(b64bytes(b64).buffer);
+  const out = new Float32Array(q.length);
+  for (let i = 0; i < q.length; i++) out[i] = q[i] / scale;
+  return out;
+}
+function decodeU16(b64) {
+  return new Uint16Array(b64bytes(b64).buffer);
+}
+
+const SCALE = C.scale, H = C.H;
+const NL = C.nLine, NF = C.nFocus, TN = C.trajN, BK = C.bendK, N = C.n;
+const lineFrom = decodeI16(C.lineFrom, SCALE);
+const lineTo = decodeI16(C.lineTo, SCALE);
+const traj = decodeI16(C.traj, SCALE);
+const x0 = decodeI16(C.x0, SCALE);
+const target = decodeI16(C.target, SCALE);
+const focus = decodeU16(C.focus);
+
+/* ---------------- renderer ---------------- */
+const W = 1920, HGT = 1080;
+const stage = document.getElementById('stage');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04050a);
+scene.fog = new THREE.FogExp2(0x04050a, 0.020);
+
+const camera = new THREE.PerspectiveCamera(42, W / HGT, 0.05, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1);
+renderer.setSize(W, HGT);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+stage.appendChild(renderer.domElement);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(new THREE.Vector2(W, HGT), 0.82, 0.55, 0.28));
+composer.addPass(new OutputPass());
+
+/* ---------------- sprite ---------------- */
+function makeSprite() {
+  const s = 64, c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2);
+  g.addColorStop(0, 'rgba(255,255,255,1)');
+  g.addColorStop(0.3, 'rgba(255,255,255,0.8)');
+  g.addColorStop(0.7, 'rgba(255,255,255,0.15)');
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const sprite = makeSprite();
+
+/* ---------------- point clouds ---------------- */
+function makeCloud(xy, z, color, size, opacity) {
+  const pos = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    pos[3*i] = xy[2*i];
+    pos[3*i+1] = xy[2*i+1];
+    pos[3*i+2] = z;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const mat = new THREE.PointsMaterial({
+    size, map: sprite, color, transparent: true, opacity,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  });
+  const p = new THREE.Points(geo, mat);
+  scene.add(p);
+  return { obj: p, mat };
+}
+const sourceCloud = makeCloud(x0, 0, 0x4a6fb5, 0.070, 0.0);
+const targetCloud = makeCloud(target, H, 0x7a3220, 0.065, 0.0);
+
+/* ---------------- line sets ---------------- */
+function lineSet(positions, color, opacity) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mat = new THREE.LineBasicMaterial({
+    color, transparent: true, opacity,
+    depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+  const obj = new THREE.LineSegments(geo, mat);
+  scene.add(obj);
+  return mat;
+}
+
+/* all real pair lines: ambient background */
+{
+  const pos = new Float32Array(NL * 6);
+  for (let k = 0; k < NL; k++) {
+    pos[6*k]   = lineFrom[2*k]; pos[6*k+1] = lineFrom[2*k+1]; pos[6*k+2] = 0;
+    pos[6*k+3] = lineTo[2*k];   pos[6*k+4] = lineTo[2*k+1];   pos[6*k+5] = H;
+  }
+  var bgMat = lineSet(pos, 0x8fa8e8, 0);
+}
+
+/* real pair lines nearest the bend: faint texture */
+{
+  const pos = new Float32Array(NF * 6);
+  for (let k = 0; k < NF; k++) {
+    const i = focus[k];
+    pos[6*k]   = lineFrom[2*i]; pos[6*k+1] = lineFrom[2*i+1]; pos[6*k+2] = 0;
+    pos[6*k+3] = lineTo[2*i];   pos[6*k+4] = lineTo[2*i+1];   pos[6*k+5] = H;
+  }
+  var focusMat = lineSet(pos, 0xb9ccff, 0);
+}
+
+/* constructed crossing lines: all pass through the bend region from different directions */
+const bend = new THREE.Vector3(traj[2*BK], traj[2*BK+1], (BK / (TN - 1)) * H);
+const tBend = BK / (TN - 1);
+{
+  const NC = 10, SPAN = 1.55;
+  const pos = new Float32Array(NC * 6);
+  for (let k = 0; k < NC; k++) {
+    const a = (k / NC) * Math.PI + 0.18;
+    const dx = Math.cos(a), dy = Math.sin(a);
+    const jx = (k % 3 - 1) * 0.035, jy = (k % 2 ? 1 : -1) * 0.025;
+    const ox = bend.x + jx, oy = bend.y + jy;
+    pos[6*k]   = ox + dx * (0 - tBend) * SPAN;
+    pos[6*k+1] = oy + dy * (0 - tBend) * SPAN;
+    pos[6*k+2] = 0;
+    pos[6*k+3] = ox + dx * (1 - tBend) * SPAN;
+    pos[6*k+4] = oy + dy * (1 - tBend) * SPAN;
+    pos[6*k+5] = H;
+  }
+  var crossMat = lineSet(pos, 0xcfe0ff, 0);
+}
+
+/* ---------------- bend trajectory ---------------- */
+const pts3 = [];
+for (let k = 0; k < TN; k++) {
+  pts3.push(new THREE.Vector3(traj[2*k], traj[2*k+1], (k / (TN - 1)) * H));
+}
+const curve = new THREE.CatmullRomCurve3(pts3, false, 'centripetal');
+const TUBE_SEG = 260, TUBE_RAD = 8;
+const tubeGeo = new THREE.TubeGeometry(curve, TUBE_SEG, 0.020, TUBE_RAD, false);
+const tubeMat = new THREE.MeshBasicMaterial({
+  color: 0xff6a2a, transparent: true, opacity: 1,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+const tube = new THREE.Mesh(tubeGeo, tubeMat);
+tubeGeo.setDrawRange(0, 0);
+scene.add(tube);
+
+/* reference straight line: thin glowing tube so it reads against the background */
+const refCurve = new THREE.LineCurve3(pts3[0].clone(), pts3[TN - 1].clone());
+const refGeo = new THREE.TubeGeometry(refCurve, 1, 0.010, 8, false);
+const refMat = new THREE.MeshBasicMaterial({
+  color: 0xcfe2ff, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+});
+scene.add(new THREE.Mesh(refGeo, refMat));
+
+/* bend glow */
+const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: sprite, color: 0xffb070, transparent: true, opacity: 0,
+  blending: THREE.AdditiveBlending, depthWrite: false,
+}));
+glow.position.copy(bend);
+glow.scale.setScalar(0.5);
+scene.add(glow);
+
+/* ---------------- camera ---------------- */
+const YAW0 = Math.PI / 4, PITCH = 0.48;
+const LOOK0 = new THREE.Vector3(0, 0, H * 0.5);
+const LOOK1 = bend.clone();
+const _look = new THREE.Vector3();
+
+const clamp01 = v => Math.max(0, Math.min(1, v));
+const smooth = v => { v = clamp01(v); return v * v * (3 - 2 * v); };
+
+function setCamera(t) {
+  const e = smooth((t - 0.08) / 0.32);
+  const dist = 11 - 8.1 * e;
+  _look.copy(LOOK0).lerp(LOOK1, e);
+  const yaw = YAW0 + 0.08 * Math.sin(t * Math.PI);
+  const dx = Math.cos(PITCH) * Math.sin(yaw);
+  const dy = Math.sin(PITCH);
+  const dz = Math.cos(PITCH) * Math.cos(yaw);
+  camera.position.set(_look.x + dx * dist, _look.y + dy * dist, _look.z + dz * dist);
+  camera.lookAt(_look);
+}
+
+/* ---------------- timeline ---------------- */
+function applyT(t) {
+  t = clamp01(t);
+  setCamera(t);
+
+  const inA = smooth(t / 0.08);
+  const push = smooth((t - 0.08) / 0.32);
+
+  bgMat.opacity    = inA * (0.055 - 0.045 * push);
+  focusMat.opacity = inA * (0.10 * (1 - push) + 0.035 * push);
+  crossMat.opacity = 0.40 * push;
+  sourceCloud.mat.opacity = inA * (0.46 - 0.38 * push);
+  targetCloud.mat.opacity = inA * (0.38 - 0.24 * push);
+
+  const draw = smooth((t - 0.40) / 0.26);
+  tubeGeo.setDrawRange(0, Math.floor(draw * TUBE_SEG) * TUBE_RAD * 6);
+
+  const refIn = smooth((t - 0.66) / 0.13);
+  refMat.opacity = 0.55 * refIn;
+
+  const gIn = smooth((t - 0.66) / 0.12);
+  const pulse = 0.5 + 0.5 * Math.sin((t - 0.66) * Math.PI * 7);
+  glow.material.opacity = gIn * (0.30 + 0.35 * pulse);
+  glow.scale.setScalar(0.38 + 0.09 * pulse);
+
+  renderFrame();
+}
+
+function renderFrame() {
+  composer.render();
+}
+
+/* ---------------- boot ---------------- */
+const params = new URLSearchParams(location.search);
+const tParam = params.get('t');
+
+if (tParam !== null) {
+  applyT(parseFloat(tParam) || 0);
+  document.documentElement.dataset.boot = 'ready';
+} else {
+  const DURATION = 12;
+  const start = performance.now();
+  function tick(now) {
+    const t = clamp01((now - start) / 1000 / DURATION);
+    applyT(t);
+    if (t < 1) requestAnimationFrame(tick);
+    else document.documentElement.dataset.boot = 'ready';
+  }
+  requestAnimationFrame(tick);
+  document.documentElement.dataset.boot = 'playing';
+}
+
+window.__seek = function (t) {
+  applyT(t);
+  return true;
+};
+window.__ready = true;
+</script>
+</body>
+</html>
